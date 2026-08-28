@@ -4,19 +4,35 @@
   mock-fallback rule as planApi/scheduleApi/taskApi: real path in prod, mock only
   on a genuine network error.
 
-  ASSUMPTION (unconfirmed with BE — flagged in the PR, not decided unilaterally):
-  the 07번 API 명세서's `GET /fixed-schedules` takes only `status` and returns a
-  flat list with no weekly concept, while `activeThisWeek` (api-contracts.md §5-J6)
-  is inherently PER WEEK — a fixed schedule can be deactivated for one week and
-  stay active every other week. Until BE confirms the real shape, this client
-  asks for the CURRENTLY VIEWED week via an extra `weekStartDate` query param and
-  expects the server to fold its week-exception state into an `activeThisWeek`
-  field per schedule. This is the smallest, most reversible guess available (one
-  extra param on an existing GET, not a second endpoint or a client-side merge of
-  two separate lists) — if BE settles on something else (e.g. a dedicated
-  GET .../week-exceptions), only `normalizeFixedSchedule` and `getFixedSchedules`
-  below need to change; every consumer already just reads `activeThisWeek` off
-  the normalized shape.
+  CONFIRMED AGAINST CONTRACT (openapi-live-76c7009.yaml — no longer a guess):
+  - `GET /fixed-schedules` (line ~1937) takes only `status`; there is no
+    `weekStartDate` param. The `weekStartDate` this client still sends is a
+    harmless no-op today, kept as a forward-compat hint in case BE adds it.
+  - `FixedSchedule` (line ~2519) has NO `activeThisWeek` field. Its `status`
+    field description explicitly says PLAN-33/34 week-scoped exclusion lives on
+    the separate `week-exceptions` sub-resource, not on this field.
+  - `week-exceptions` (line ~2016) is POST/DELETE-only — there is NO GET. So
+    there is currently no way to ask the server "which fixed schedules are
+    excepted this week"; a freshly loaded/refreshed screen cannot recover that
+    state from the server at all.
+  - The concept IS already modeled server-side, just not wired to this
+    endpoint yet: `WeeklyPlanView.fixedSchedules[].activeThisWeek` (line
+    ~2578) exists on the weekly-plan-view schema, but `GET /weekly-plans`'s
+    own summary (line ~1627) says fixed schedules/availability/validation
+    summary are "후속 편입" (a later increment) — the schema is reserved, not
+    populated yet. When that lands, `getFixedSchedules` below can read
+    `activeThisWeek` straight off the server response again and this whole
+    session-memory workaround becomes dead code (safe to delete, not rewrite).
+
+  WORKAROUND (until the above ships): `sessionWeekExceptions` below remembers
+  exceptions the user creates/clears in THIS browser session, keyed per
+  (schedule, week), and `normalizeFixedSchedule` consults it before falling
+  back to the server field (which is always absent today, so today it always
+  falls through to the `true` default — see that default's own comment for why
+  fail-open beats fail-closed here). This is a client-only patch over a real
+  contract gap, not a redesign: it disappears the moment the server field is
+  actually populated, because the session map is only ever consulted first —
+  see `normalizeFixedSchedule` for the read order.
 */
 
 import { apiClient } from '../../api/client'
@@ -24,6 +40,34 @@ import { withDevFallback, minutesFromTime, timeFromMinutes } from './planApi'
 import { addDaysISO } from './planTime'
 import { mockBackend } from './planFixtures'
 import { unwrapList } from '../../api/unwrap'
+
+/**
+ * In-memory, THIS-TAB-ONLY record of week exceptions the user created or
+ * cleared since page load. Keyed `` `${fixedScheduleId}::${weekStartISO}` ``,
+ * valued with the resulting `activeThisWeek` the schedule should render as —
+ * i.e. `false` (ghosted) while a PLAN-33 exception is active for that week.
+ * Storing the resolved boolean directly (not an "exception exists" flag) is
+ * deliberate: normalizeFixedSchedule below plugs this value straight into
+ * `activeThisWeek` with no inversion, so there is exactly one place that ever
+ * has to reason about the false-means-excepted polarity.
+ * Absent = "this session never touched this (schedule, week) pair" — that is
+ * NOT the same as "confirmed active"; it just means normalizeFixedSchedule
+ * falls through to the server-field default below.
+ *
+ * Why module-scope `Map` and not React state/cache: it must survive query
+ * invalidation/refetch (the whole point — `useToggleFixedException` calls
+ * `invalidateQueries` on success, which re-runs `getFixedSchedules`, which
+ * must still see the exception it just wrote) and it must be shared by every
+ * consumer of this module without threading it through props/context for a
+ * value that's a pure workaround, not real UI state.
+ *
+ * Known gaps (both only fixable server-side, see file header):
+ * - Lost on refresh/new tab — the server has no GET for week-exceptions, so
+ *   there's nothing to rehydrate this from.
+ * - Invisible across devices/sessions — an exception made on another device
+ *   won't show here until the server field ships.
+ */
+const sessionWeekExceptions = new Map()
 
 /**
  * Normalize a fixed schedule to the camelCase shape the grid AND the ST-F1-12
@@ -36,10 +80,19 @@ import { unwrapList } from '../../api/unwrap'
  * them — neither the ST-F1-06 grid nor FixedScheduleForm (ST-F1-12's own CRUD
  * form only edits title/weekday/start/end minutes). They're reserved fields,
  * unused/on hold until a future story actually surfaces them in the UI.
+ *
+ * `weekStartISO` is OPTIONAL and only meaningful for the week-scoped grid read
+ * (`getFixedSchedules`) — the week-agnostic settings list (`getAllFixedSchedules`)
+ * calls this without it, which deliberately skips the session-exception lookup
+ * below (a settings-list row isn't "this week", so there's no key to look up).
  */
-function normalizeFixedSchedule(f) {
+function normalizeFixedSchedule(f, weekStartISO) {
+  const fixedScheduleId = f.fixedScheduleId ?? f.fixed_schedule_id
+  const sessionOverride = weekStartISO
+    ? sessionWeekExceptions.get(`${fixedScheduleId}::${weekStartISO}`)
+    : undefined
   return {
-    fixedScheduleId: f.fixedScheduleId ?? f.fixed_schedule_id,
+    fixedScheduleId,
     title: f.title,
     weekday: f.weekday,
     // 🔴 서버는 `startTime`/`endTime`을 시각 문자열("09:00:00")로 보낸다 —
@@ -49,11 +102,17 @@ function normalizeFixedSchedule(f) {
     //    사슬을 그대로 따른다 — 목(분 단위)과 실서버(시각 문자열)를 둘 다 받는다.
     startMinutes: f.startMinutes ?? f.start_minutes ?? minutesFromTime(f.startTime ?? f.start_time),
     endMinutes: f.endMinutes ?? f.end_minutes ?? minutesFromTime(f.endTime ?? f.end_time),
-    // Defaults to true: a server that doesn't yet understand week exceptions
-    // (or omits the field) should render every fixed schedule as ACTIVE, not
-    // silently ghost all of them — an unrecognized false would be the wrong
-    // failure direction (hiding a real conflict), so only an explicit false wins.
-    activeThisWeek: (f.activeThisWeek ?? f.active_this_week) !== false,
+    // Read order: session override (this tab's own add/remove-exception calls,
+    // confirmed by the server — see addFixedException/removeFixedException)
+    // wins first, since it's the only source that can actually be right about
+    // THIS week today (contract gap, see file header). Falls back to the server
+    // field for forward-compat once it ships. Defaults to true: a server that
+    // doesn't yet understand week exceptions (or omits the field) should render
+    // every fixed schedule as ACTIVE, not silently ghost all of them — an
+    // unrecognized false would be the wrong failure direction (hiding a real
+    // conflict), so only an explicit false (session or server) wins.
+    activeThisWeek:
+      sessionOverride !== undefined ? sessionOverride : (f.activeThisWeek ?? f.active_this_week) !== false,
     // 🔴 서버가 보내는 이름은 `startDate`/`endDate`다. 이름이 어긋나 항상 null이
     //    됐고, 그래서 **하루짜리 일정이 매주 반복으로 보였다** — 외부 캘린더에서
     //    반영한 일정(ExternalEventToFixedSchedule이 startDate=endDate=그 날짜로
@@ -120,8 +179,11 @@ function activeInWeek(schedule, weekStartISO) {
 }
 
 /**
- * OP-FIXED-LIST → GET /fixed-schedules?status=ACTIVE&weekStartDate= (ASSUMPTION
- * above). Returns the week's recurring fixed schedules with `activeThisWeek`.
+ * OP-FIXED-LIST → GET /fixed-schedules?status=ACTIVE&weekStartDate= (the
+ * `weekStartDate` param is a no-op today — see file header). Returns the
+ * week's recurring fixed schedules with `activeThisWeek`, resolved through
+ * `sessionWeekExceptions` first (see normalizeFixedSchedule) since the server
+ * doesn't carry this per-week signal yet.
  */
 export function getFixedSchedules(weekStartISO) {
   return withDevFallback(
@@ -133,7 +195,7 @@ export function getFixedSchedules(weekStartISO) {
     // Real: `data:[FixedSchedule]` (array). Mock: `{ fixedSchedules: [...] }`.
   ).then((r) =>
     unwrapList(r, 'fixedSchedules')
-      .map(normalizeFixedSchedule)
+      .map((f) => normalizeFixedSchedule(f, weekStartISO))
       // 서버가 weekStartDate 를 받고도 날짜 경계로 걸러 주지 않으므로 여기서 건다.
       // 서버가 나중에 걸러 주게 되면 이 필터는 그냥 통과라 이중으로 걸려도 무해하다.
       .filter((f) => activeInWeek(f, weekStartISO)),
@@ -144,6 +206,15 @@ export function getFixedSchedules(weekStartISO) {
  * OP-FIXED-EXCEPT-ADD → POST /fixed-schedules/{id}/week-exceptions (PLAN-33 이번
  * 주만 비활성화). Body carries the week the exception applies to — the endpoint
  * itself has no other way to know which week the current screen is showing.
+ *
+ * Records the exception into `sessionWeekExceptions` ONLY in `.then()`, i.e.
+ * only once the server has actually confirmed it — never optimistically
+ * before the call. If we set it up front and the request then failed, the
+ * grid would show the schedule as excepted (ghosted) while the server still
+ * has it active — a false "this time slot is free" that is exactly the wrong
+ * direction for a scheduling conflict guard to fail in. Failing to *show* an
+ * exception that did succeed is recoverable (retry/refresh); failing to show
+ * a block that's still actually there is not.
  */
 export function addFixedException(fixedScheduleId, weekStartISO) {
   return withDevFallback(
@@ -152,7 +223,10 @@ export function addFixedException(fixedScheduleId, weekStartISO) {
         weekStartDate: weekStartISO,
       }),
     () => mockBackend.addFixedWeekException(fixedScheduleId, weekStartISO),
-  )
+  ).then((result) => {
+    sessionWeekExceptions.set(`${fixedScheduleId}::${weekStartISO}`, false)
+    return result
+  })
 }
 
 /**
@@ -161,12 +235,22 @@ export function addFixedException(fixedScheduleId, weekStartISO) {
  * ever consumed via `useMutation` (retry:0) — DELETE gets no automatic retry
  * either, per the retry-policy note above OP-FIXED-EXCEPT-ADD/DEL: automatic
  * retry is a GET-only privilege, writes retry solely on the user's own click.
+ *
+ * On confirmed success, DELETES the map entry rather than setting it to
+ * `false`. This session has no evidence the schedule is active beyond "it's
+ * not excepted anymore" — deleting lets it fall through to
+ * normalizeFixedSchedule's own default (server field, else true) instead of
+ * this function asserting a fact (definitely active) it can't actually back
+ * up. Same fail-open reasoning as the file-header default.
  */
 export function removeFixedException(fixedScheduleId, weekStartISO) {
   return withDevFallback(
     () => apiClient.delete(`/fixed-schedules/${fixedScheduleId}/week-exceptions/${weekStartISO}`),
     () => mockBackend.removeFixedWeekException(fixedScheduleId, weekStartISO),
-  )
+  ).then((result) => {
+    sessionWeekExceptions.delete(`${fixedScheduleId}::${weekStartISO}`)
+    return result
+  })
 }
 
 // --- ST-F1-12: 고정 일정 관리 (설정) — CRUD + 충돌 미리보기 --------------------
