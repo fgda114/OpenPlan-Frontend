@@ -134,8 +134,20 @@ export function postAutoPlacements(weeklyPlanId, priorityType) {
     () => apiClient.post(`/weekly-plans/${weeklyPlanId}/auto-placements`, { priorityType }),
     () => mockBackend.autoPlace(weeklyPlanId, priorityType),
   ).then((r) => ({
-    placements: r?.placements ?? [],
-    unplaced: (r?.unplaced ?? []).map(normalizeTask),
+    // 🔴 CONTRACT (openapi PlacementProposal): `proposedBlocks` · `unplacedTaskIds`.
+    // 이 어댑터는 오래도록 `placements` · `unplaced` 라는, 계약에 없는 이름을 읽고
+    // 있었다. 목이 그 이름을 그대로 돌려줬기 때문에 DEV 에서는 완벽히 동작했고,
+    // 실서버에서만 두 배열이 **언제나 비었다** — 서버가 5건을 배치해 보내도 화면은
+    // "배치 0건" 이 되고, `적용` 은 placedCount === 0 이라 영구 비활성이었다
+    // (2026-08-28 실서버 응답으로 확인). 목도 함께 계약 이름으로 고쳤다.
+    placements: r?.proposedBlocks ?? [],
+    // 🔴 계약은 태스크 **객체가 아니라 UUID 배열**이다. 그래서 normalizeTask 를
+    //    씌우지 않는다(씌우면 id 문자열을 태스크로 오해해 빈 객체가 된다).
+    //    현재 소비자는 개수뿐이다(WeeklyPage → AutoPlaceBar unplacedCount).
+    unplaced: r?.unplacedTaskIds ?? [],
+    // 배치 근거(규칙 경로면 정렬 규칙, AI 경로면 모델이 쓴 문구). 아직 화면에
+    // 쓰지 않지만 계약 필드라 버리지 않고 그대로 싣는다.
+    reason: r?.reason ?? null,
   }))
 }
 
@@ -144,8 +156,22 @@ export function postAutoPlacements(weeklyPlanId, priorityType) {
  * auto-place draft as a batch of blocks. Returns { placedCount }.
  */
 export function postBlockBatch(weeklyPlanId, placements) {
+  // 🔴 CONTRACT (openapi applyBlockBatch): body 는 `{ operations: [...] }` 이고
+  //    operations 는 @NotEmpty 다. 여기서 보내던 `{ placements }` 는 계약에 없는
+  //    모양이라 실서버에서 400 이었다 — 초안을 적용할 방법이 아예 없었다.
+  //    단위 연산은 op(CREATE/MOVE/DELETE) + block(PlanBlockInput) 조합이고,
+  //    자동 배치 초안의 적용은 전부 CREATE 다(전부 새 TASK 블록).
+  const operations = (placements ?? []).map((p) => ({
+    op: 'CREATE',
+    block: {
+      blockType: 'TASK',
+      taskId: p.taskId,
+      startAt: p.startAt,
+      endAt: p.endAt,
+    },
+  }))
   return withDevFallback(
-    () => apiClient.post(`/weekly-plans/${weeklyPlanId}/block-batches`, { placements }),
+    () => apiClient.post(`/weekly-plans/${weeklyPlanId}/block-batches`, { operations }),
     () => mockBackend.commitBatch(weeklyPlanId, placements),
   )
 }

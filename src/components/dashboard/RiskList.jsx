@@ -5,7 +5,7 @@ import { ErrorState } from '../common/ErrorState'
 import { CheckCircleIcon } from '../common/statusIcons'
 import { severityLabels } from '../../features/plan/violationMessages'
 import { resolveIssueCopy } from '../../features/dashboard/dashboardIssueCopy'
-import { resolveActionLabel } from '../../features/dashboard/actionRouting'
+import { resolveActionLabel, resolveActionRoute, resolveRiskRoute } from '../../features/dashboard/actionRouting'
 
 /*
   S5 · 먼저 확인할 내용 — DASH-03·04에 더해 S2 우선 행동(DASH-02·RB-DASH-01)까지
@@ -32,9 +32,15 @@ import { resolveActionLabel } from '../../features/dashboard/actionRouting'
   (아래 ACTION_TYPE_TO_RISK_TYPE)으로 dedup한다 — 이것도 결정문에 없는 판단값
   (같은 문제를 가리킨다는 계약상 보장은 없음, 예전 dedup과 동일하게 "방어적
   조치"일 뿐) — 매칭되지 않는 actionType(RESOLVE_OVERLAP 등, riskType 4종에
-  대응이 없음)은 그냥 최상단 별도 행으로 추가한다. `routePath`는 이제 서버가
-  둘 다 직접 주므로, actionRouting.js의 `to()` 빌더는 더 이상 없다 — 클릭 시
-  그 값으로 바로 이동한다(라우트가 없는 행은 여전히 비인터랙티브 <div>).
+  대응이 없음)은 그냥 최상단 별도 행으로 추가한다.
+
+  routePath 정정(W6, 2026-08-28 — 리드 실서버 확인): 서버 `routePath`는 URL이
+  아니라 화면 명세 식별자 문자열이다(예: "SCR-PLAN 미배치 패널") — 그대로
+  이동하면 404가 난다. `actionRouting.js`의 `to()` 빌더(actionType/riskType →
+  실제 앱 라우트)를 되살렸다 — 클릭 시 그 카탈로그가 준 경로로 이동하고,
+  서버 routePath는 카탈로그가 모르는 값일 때 `/`로 시작하는 경우에만 최후
+  수단 폴백으로 쓴다(자세한 근거는 actionRouting.js 헤더). 라우트가 없는
+  행은 여전히 비인터랙티브 <div>.
 */
 
 // priorityAction.actionType → 대응하는 riskIssues[].riskType. 매칭되는 게
@@ -125,7 +131,14 @@ export function RiskList({ error = false, onRetry, priorityAction = null, risks 
       <ul className="mt-2 divide-y divide-border">
         {sorted.map((risk) => {
           const copy = resolveIssueCopy(risk)
-          const to = risk.routePath || null
+          // §DASH.2/actionRouting.js가 유일 정본 — 서버 routePath는 URL이
+          // 아니라 화면 명세 라벨(예: "SCR-PLAN 미배치 패널")이라 그대로 쓰면
+          // 404가 난다(actionRouting.js 헤더 참고, 실서버로 반증된 결함).
+          // priorityAction 파생 행(actionType 있음)은 actionType 축으로,
+          // 일반 riskIssues 행은 riskType 축으로 각각 카탈로그를 거친다.
+          const to = risk.actionType
+            ? resolveActionRoute(risk.actionType, risk.routePath)
+            : resolveRiskRoute(risk.riskType, risk.routePath)
           // priorityAction 파생 행에만 actionType이 있다 — 그 라벨을 sr-only로
           // 앞세워 스크린 리더 사용자가 "무엇을 하는 이동인지" 시각 사용자보다
           // 덜 알게 되지 않도록 한다(일반 riskIssues 행은 actionType이 계약에

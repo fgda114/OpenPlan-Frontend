@@ -1,0 +1,369 @@
+# AI 코드 리뷰 — PR 이 열리거나 푸시되면 Claude 가 리뷰를 코멘트로 달고, 판정을 체크로 낸다.
+#
+# 🔴 이 파일은 백엔드 저장소에서 이식했다(2026-08-28). 그쪽이 하루 동안 실장애로
+#    잡아낸 것들이 전부 들어 있다 — 예산을 HEAD SHA 기준으로 · 판정에 SHA 와 작성자
+#    검증 · gh 에 --arg 금지 · 스텝 env 로 GH_TOKEN 을 덮지 않기 · 요약을
+#    gh pr comment 로 직접 올리기. **그 주석들을 지우지 말 것.** 각 줄이 사고 기록이다.
+#
+# 왜 프론트에도 다는가: 이 저장소는 지금까지 자동 리뷰가 없었고, 그 사이 계약 불일치가
+# 조용히 쌓였다. 2026-08-28 하루에만 네 건이 한꺼번에 드러났다 — 고정 일정 시각
+# (startMinutes ↔ startTime) · 날짜 경계(effectiveFrom ↔ startDate) · 구글 인가 코드
+# (authCode ↔ code) · 충돌 미리보기 봉투. 넷 다 화면에는 그럴듯하게 보이고
+# (NaN, 빈 목록, "확인하지 못했습니다"), 서버에 붙여 봐야만 드러났다.
+# 사람 리뷰로 잡기 가장 어려운 종류다.
+#
+# 🔴 2026-08-25 운영 규칙 변경 (사용자 확정):
+#    모든 PR 은 AI 리뷰를 거친다. Blocking 이 있으면 고치고 다시 리뷰받는다.
+#    **Blocking 이 없으면 사람 승인 없이 머지한다.**
+#    그래서 이 워크플로는 더 이상 "코멘트만 다는" 것이 아니다 — **머지 게이트다.**
+#    Blocking 이 1건이라도 있으면 잡이 실패해 보호 규칙이 머지를 막는다.
+#
+# 🔴 초록 체크를 판정으로 읽지 말 것 — 그래서 이렇게 만들었다.
+#    이전 버전은 Blocking 2건짜리 PR 에서도 잡이 성공했다(#33, 2026-08-23).
+#    "잡이 돌았다"와 "지적이 없다"는 다른 사실이다. 아래 판정 스텝이 그 둘을 가른다.
+#    리뷰가 아무 산출물도 안 남긴 경우(#44 — 11분 돌고 코멘트 0건)도 **실패로 친다.**
+#    판정이 없는 것은 통과가 아니다.
+
+name: AI 코드 리뷰
+
+on:
+  pull_request:
+    # PR 당 최대 5회 (사용자 확정, 2026-08-25). 이전에는 1회였다.
+    # synchronize 를 넣어 "고치고 다시 리뷰" 가 자동으로 돌게 한다.
+    # 🔴 한도는 팀원의 대화형 Claude Code 사용과 같은 지갑이다 — 그래서 무제한이 아니라 5회다.
+    #    예산 계산은 아래 예산 스텝이 한다.
+    types: [opened, ready_for_review, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "다시 리뷰할 PR 번호"
+        required: true
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+  # 같은 커밋(HEAD SHA)에서 허용하는 자동 리뷰 횟수. 일시적 실패 재시도 여유로 2.
+  # 고쳐서 새 커밋을 올리면 새로 2회를 받는다 — 라운드 수 자체에는 상한이 없다.
+  SHA_BUDGET: 2
+  # 브랜치 누적 안전망(폭주 방지). 여기에 닿으면 사람이 들여다볼 때다.
+  PR_CEILING: 20
+  # 🔴 판정 마커를 쓸 수 있는 유일한 작성자. 이 값이 게이트의 신뢰 근거다 —
+  #    바꾸면 아무나 판정을 쓸 수 있게 되는 것과 같으니 신중히.
+  REVIEW_BOT: "claude[bot]"
+
+jobs:
+  review:
+    # 초안(draft)은 건너뛴다 — 준비되면 ready_for_review 로 다시 걸린다.
+    if: github.event.pull_request.draft == false || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+
+    steps:
+      # ── 0. 수동 실행의 PR 맥락 ─────────────────────────────────────────────
+      # 🔴 workflow_dispatch 에는 github.event.pull_request 가 없다 (D-89, 2026-08-26).
+      #    그래서 HEAD SHA 도, 코멘트를 붙일 PR 엔티티도 없다. 옛 구현은 이걸 모르고
+      #    돌아 **리뷰가 72턴·$2.71 을 쓰고도 산출물 0** 이었고(잡은 success), 판정 스텝은
+      #    그 사이 옛 코멘트를 집었다. 여기서 SHA 를 직접 조회해 뒤 스텝들에 넘긴다.
+      - name: 수동 실행 — PR 의 HEAD SHA 조회
+        id: dispatch_sha
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')
+          echo "PR #${PR_NUMBER} HEAD = ${SHA}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      # ── 1. 예산 ────────────────────────────────────────────────────────────
+      # 🔴 2026-08-26 실장애로 계산 기준을 바꿨다 (D-91).
+      #    옛 구현은 "그 **브랜치**에서 끝난 실행 수" 를 셌다. 이 수는 **줄지 않는다** —
+      #    고칠수록 예산이 닳고, 다 쓰면 **고쳐도 판정을 못 받는다.** 라운드가 많이 필요한 PR
+      #    = 결함이 많아 게이트가 가장 필요한 PR 이 정확히 그 게이트에서 먼저 잠긴다.
+      #    PR #33 이 그렇게 영구 봉쇄됐다(자동 5/5 소진 + 수동 경로도 D-89 로 막힘).
+      #
+      #    지금은 **현재 HEAD SHA** 기준으로 센다. 고쳐서 새 커밋을 올리면 새 예산을 받고,
+      #    **같은 코드로 반복 재시도하는 것만** 막힌다 — 원래 막고 싶었던 것이 그쪽이다.
+      #    취소된 실행은 뺀다(연속 푸시 때 cancel-in-progress 로 죽은 것까지 세면 안 된다).
+      #
+      #    PR 누적 상한은 안전망으로만 남긴다. 지갑이 팀원 대화형 사용과 공유라 무한은 안 되지만,
+      #    상한이 **고칠 길을 막아서는 안 된다** — 그래서 SHA 예산보다 훨씬 헐겁게 잡는다.
+      - name: 예산 확인 (같은 코드 재리뷰 제한)
+        id: budget
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          USED=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ai-review.yml/runs?head_sha=${HEAD_SHA}&per_page=100" \
+            --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion != "cancelled")] | length')
+          TOTAL=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ai-review.yml/runs?branch=${HEAD_BRANCH}&per_page=100" \
+            --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion != "cancelled")] | length')
+          echo "이 커밋(${HEAD_SHA:0:7})에서 끝난 리뷰: ${USED}회 / 예산 ${SHA_BUDGET}회"
+          echo "이 브랜치 누적: ${TOTAL}회 / 안전망 ${PR_CEILING}회"
+          if [ "${USED}" -ge "${SHA_BUDGET}" ]; then
+            echo "exhausted=same-code" >> "$GITHUB_OUTPUT"
+          elif [ "${TOTAL}" -ge "${PR_CEILING}" ]; then
+            echo "exhausted=ceiling" >> "$GITHUB_OUTPUT"
+          else
+            echo "exhausted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 2. 리뷰 ────────────────────────────────────────────────────────────
+      # 얕은 클론이면 diff 기준이 안 잡힌다. 전체를 받아야 계약 정본·ADR 도 읽을 수 있다.
+      - uses: actions/checkout@v4
+        if: steps.budget.outputs.exhausted == '' || steps.budget.outputs.exhausted == 'false'
+        with:
+          fetch-depth: 0
+          # 🔴 workflow_dispatch 는 PR 이 아니라 **기본 브랜치**(대개 main)를 체크아웃한다
+          #    (2026-08-27 2차 리뷰). 그러면 리뷰어는 main 의 openapi.yaml·마이그레이션을
+          #    읽으면서 PR 의 diff 를 판정한다 — **엉뚱한 기준과 대조**하는 것이고,
+          #    이 저장소의 결함은 대부분 "계약과의 어긋남" 이라 그 대조가 리뷰의 핵심이다.
+          #    D-89 는 "코멘트가 안 남는" 증상만 고쳤고 "무엇을 리뷰하는가" 는 남아 있었다.
+          #    pull_request 는 빈 값 → checkout 기본 동작(머지 커밋)을 그대로 둔다.
+          ref: ${{ github.event_name == 'workflow_dispatch' && steps.dispatch_sha.outputs.sha || '' }}
+
+      # 🔴 위 ref 표현식이 옳다는 것을 **믿지 말고 증명한다.**
+      #    표현식 한 글자만 어긋나도 조용히 기본 브랜치를 보게 되고, 그 리뷰는
+      #    "돌기는 했는데 엉뚱한 것을 본" 상태가 된다 — 이 저장소가 반복해서 당한 모양이다.
+      #    기대 SHA 가 체크아웃된 이력 안에 있는지 확인한다(자기 자신도 조상으로 친다).
+      #    pull_request 의 머지 커밋에서는 head.sha 가 부모라 통과하고,
+      #    dispatch 가 잘못 main 을 잡으면 PR head 가 main 에 없어 즉시 실패한다.
+      - name: 체크아웃 검증 — 지금 보고 있는 것이 그 PR 의 코드인가
+        if: steps.budget.outputs.exhausted == '' || steps.budget.outputs.exhausted == 'false'
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || steps.dispatch_sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EXPECTED_SHA}" ]; then
+            echo "::error::기대 SHA 가 비어 있습니다 — 무엇을 리뷰해야 하는지 알 수 없습니다."
+            exit 1
+          fi
+          echo "체크아웃 HEAD : $(git rev-parse HEAD)"
+          echo "기대 SHA      : ${EXPECTED_SHA}"
+          if ! git cat-file -e "${EXPECTED_SHA}^{commit}" 2>/dev/null; then
+            echo "::error::기대 SHA(${EXPECTED_SHA})가 체크아웃에 없습니다 — 다른 것을 받았습니다."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${EXPECTED_SHA}" HEAD; then
+            echo "::error::기대 SHA(${EXPECTED_SHA})가 체크아웃 이력에 없습니다."
+            echo "리뷰가 이 PR 이 아니라 다른 코드를 보게 됩니다 — 판정이 무의미해집니다."
+            exit 1
+          fi
+          echo "✅ 이 PR 의 코드를 보고 있습니다."
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.budget.outputs.exhausted == '' || steps.budget.outputs.exhausted == 'false'
+        # 🔴 여기에 env: GH_TOKEN 을 넣지 말 것 (2026-08-27 실장애).
+        #    #49 에서 "에이전트가 gh 를 쓸 수 있어야 한다"며 secrets.GITHUB_TOKEN 을 넣었는데,
+        #    그 뒤로 **리뷰가 코멘트를 한 건도 못 올렸다** — 네 회차 연속으로 잡은 success,
+        #    is_error: false, permission_denials_count: 0 인데 산출물만 0 이었다(약 $11 소모).
+        #    액션은 OIDC 로 자기 앱 토큰(claude[bot])을 따로 받아 코멘트를 단다("Using
+        #    GITHUB_TOKEN from OIDC"). 스텝 env 로 워크플로 토큰(github-actions[bot])을
+        #    덮어씌우면 그 경로가 어긋난다. 08-25 까지 잘 돌던 구성에는 이 블록이 없었다.
+        with:
+          # Max 구독 토큰으로 인증한다 — 종량 과금 대신 구독 한도를 쓴다.
+          # 🔴 이 한도는 팀원의 대화형 Claude Code 사용과 **같은 지갑**이다
+          #    (5시간 롤링 + 주간 창 공유). 그래서 위 트리거를 PR 당 5회로 묶었다.
+          # 🔴 토큰 수명 1년 · `claude setup-token` 을 실행한 사람의 구독에 묶인다.
+          #    만료되면 인증 실패로 CI 가 빨개진다 — 2027-08 쯤 갱신할 것.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # 🔴 코멘트를 올리는 MCP 서버는 --allowedTools 에 그 도구가 적혀 있을 때만
+          #    시작한다. 안 적으면 서버가 아예 안 떠서 아무것도 못 올린다.
+          # 🔴 --allowedTools 를 쓰면 여기 없는 도구는 "권한을 물어보는" 상태가 되는데
+          #    CI 에는 답할 사람이 없어 그대로 막힌다. 그래서 읽기 도구도 함께 적는다
+          #    (2026-08-21 실측: 안 적었더니 권한 거부 12건으로 23턴을 헛돌았다).
+          # 🔴 --max-turns 는 넉넉해야 한다. 모자라면 error_max_turns 로 끊기는데,
+          #    그때는 요약도 인라인 코멘트도 안 남아 **비용만 쓰고 산출물이 0** 이 된다.
+          #    상한 25 는 파일 1개짜리 스모크 PR(10턴) 기준이었고, 실제 PR 에서는
+          #    프롬프트가 시키는 준비(가이드·diff·openapi 2,300줄·마이그레이션 대조)만으로
+          #    다 쓴다 — 2026-08-23 실측: 40줄짜리 PR #38 이 22턴, 40파일짜리 PR 4건은
+          #    전부 25턴에서 잘려 $4.26 를 쓰고 코멘트 0건이었다.
+          #
+          #    🔴 2026-08-27 에 80 에서도 같은 일이 났다 — PR #33(외부 캘린더, 계약 미구현
+          #    15건 중 8건이 몰린 큰 PR)이 **82턴**을 써서 상한 80 을 2턴 넘겼다.
+          #    리뷰 자체는 정상 완료했는데(`is_error: false`) 액션이 실패로 처리해
+          #    **$5.20 을 쓰고 산출물이 0** 이었다. 25→80 때와 정확히 같은 실패다.
+          #    150 으로 올린다. 큰 PR 은 앞으로도 나오고, 잘린 리뷰는 비용만 쓰고
+          #    아무것도 남기지 않으므로 **상한이 모자란 쪽이 넉넉한 쪽보다 비싸다.**
+          #    ⚠️ 이 한도는 팀원의 대화형 사용과 같은 지갑이다 — 무한이 아니라 150 이다.
+          claude_args: |
+            --model claude-sonnet-5
+            --max-turns 150
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Read,Grep,Glob,Bash"
+          # ⚠️ 이 옵션은 **agent 모드에서는 아무 일도 하지 않는다** (2026-08-27 규명).
+          #    액션은 `prompt:` 가 있으면 agent 모드로 도는데(로그: "Auto-detected mode: agent"),
+          #    그 모드는 tag 모드의 comment tracking 을 통째로 우회한다
+          #    (`src/modes/agent/index.ts`: `claudeCommentId: undefined, // No tracking comment
+          #    in agent mode`). 붙일 코멘트가 없으니 스티키도 성립하지 않는다.
+          #    전용 MCP 도구(`mcp__github_comment__update_claude_comment`)도 답이 아니다 —
+          #    허용 목록에 넣어 서버를 띄워도 `CLAUDE_COMMENT_ID` 가 없어 호출 즉시 던진다
+          #    (`src/mcp/github-comment-server.ts`). 그래서 요약은 프롬프트에서 지시하는
+          #    `gh pr comment` 로만 올라간다. 이 줄은 오해를 낳지 않도록 남겨 두되, 믿지 말 것.
+          use_sticky_comment: true
+          prompt: |
+            PR #${{ github.event.pull_request.number || inputs.pr_number }} 를 리뷰한다.
+
+            먼저 `.github/review-guide.md` 를 읽고 **그 지침대로** 리뷰한다.
+            등급 체계(Blocking / Should-fix / Nit)와 중점 항목이 거기에 있다.
+
+            변경 범위는 `gh pr diff ${{ github.event.pull_request.number || inputs.pr_number }}` 로 본다.
+
+            🔴 **diff 만 보지 마라. 계약 정본은 이 저장소에 없다 — 백엔드 저장소에 있다.**
+            API 를 부르거나 응답을 읽는 변경이면 **반드시** 먼저 받아서 대조한다:
+
+                curl -fsSL -o /tmp/openapi.yaml \
+                  https://raw.githubusercontent.com/Seeds-OpenPlan/OpenPlan-Backend/main/src/main/resources/static/openapi.yaml
+
+            이 저장소에서 나온 결함은 **거의 전부** 이 대조로만 잡히는 종류였다.
+            필드 이름 하나가 어긋나면 화면은 NaN 이나 빈 목록을 그리고, 그것이 결함이 아니라
+            "데이터가 없는 상태" 처럼 보인다. 자세한 것은 가이드의 사례 절에 있다.
+
+            지적은 **해당 줄에 인라인 코멘트**로 달고, 마지막에 **결론 요약**을 남긴다.
+            지적이 하나도 없으면 요약만 남긴다 — 아무것도 안 남기면 안 된다.
+
+            🔴 **네 판정은 CI 를 막지 않는다. 사람이 읽고 판단한다.**(2026-08-27 변경)
+            Blocking 을 적어도 체크는 초록이고 머지도 막히지 않는다 — 그래서 **네가 적은 것을
+            사람이 읽느냐가 유일한 안전장치다.** 등급을 정확히 매기고, 왜 문제인지와 어떻게
+            재현되는지를 그 자리에서 납득되게 써라. 막아 줄 장치가 없으니 설득이 곧 방어다.
+            확신이 없으면 Blocking 이 아니라 Should-fix 로 내린다.
+
+            🔴 **요약 코멘트의 맨 마지막 줄에 아래 형식의 한 줄을 반드시 그대로 남긴다.**
+            자동 판정이 이 줄만 읽는다. 빠지면 리뷰가 실패한 것으로 처리된다.
+
+                <!-- REVIEW-VERDICT blocking=N sha=${{ github.event.pull_request.head.sha || steps.dispatch_sha.outputs.sha }} -->
+
+            N 은 Blocking 건수다(0 이면 `blocking=0`). `sha=` 값은 **위에 적힌 그대로** 옮긴다.
+            🔴 **SHA 를 바꾸거나 줄이지 않는다.** 판정은 "지금 이 커밋"에 대한 것임을 그 값으로 증명한다 —
+            값이 틀리면 판정이 없는 것으로 처리돼 리뷰가 헛돈다.
+
+            🔴 **요약은 네가 직접 올려야 한다. 최종 메시지로 남기면 아무 데도 안 간다.**
+            이 워크플로는 `prompt:` 를 직접 주므로 액션이 **agent 모드**로 돈다. agent 모드에는
+            네 메시지를 대신 게시해 주는 주체가 **없다**(액션 소스: `claudeCommentId: undefined,
+            // No tracking comment in agent mode`). 그러므로 작업의 **마지막에 반드시** 이렇게 올려라:
+
+                gh pr comment ${{ github.event.pull_request.number || inputs.pr_number }} \
+                  --body-file <요약을 쓴 파일>
+
+            `gh` 는 이미 인증돼 있다(액션이 `GH_TOKEN` 을 넘겨준다). 이벤트 종류와 무관하게
+            **언제나** 이 명령을 한 번 실행한다 — `pull_request` 든 `workflow_dispatch` 든 같다.
+
+            인라인 지적을 아무리 많이 달아도 **이 요약 코멘트가 없으면 판정이 없다.**
+            어떤 경우에도 요약 없이 끝내지 마라 — 리뷰가 통째로 헛돈 것이 된다.
+
+            지켜야 할 것:
+            - **승인(Approve)하지 않는다. 머지하지 않는다.** 코멘트만 단다.
+            - 파일을 고치거나 커밋하지 않는다. 읽고 지적만 한다.
+            - `npm install` 이나 전체 빌드를 돌리지 않는다 — 느리고 턴만 먹는다.
+              다만 지적을 입증하려 **짧은 코드 조각(node -e 등)을 돌려보는 것은 허용**한다.
+              🔴 이 저장소에는 유닛 테스트가 없다(e2e 만 playwright 로 따로 돈다). 그래서
+              "테스트가 이미 잡는다" 는 반론이 성립하지 않는다 — 계약 대조가 그 자리를 대신한다.
+            - **Nit 은 적지 않는다**(마감까지 끈다). Blocking 과 Should-fix 만 보고한다.
+            - **총 10건 상한.** 넘으면 심각한 순으로 자르고 몇 건을 잘랐는지 밝힌다.
+            - 재현 조건을 구체적으로 쓸 수 없으면 **적지 않는다.**
+            - 지적할 것이 없으면 "Blocking 0건"이라고 분명히 쓴다. 억지로 만들지 않는다.
+
+      # ── 3. 판정 ────────────────────────────────────────────────────────────
+      # 항상 돈다. 예산이 소진돼 리뷰를 건너뛴 회차에서도 결과를 내야 하기 때문이다.
+      - name: 판정 — Blocking 이 있으면 머지를 막는다
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.dispatch_sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          case "${{ steps.budget.outputs.exhausted }}" in
+            same-code)
+              echo "::error::같은 커밋(${HEAD_SHA:0:7})에서 이미 리뷰 ${SHA_BUDGET}회를 썼습니다."
+              echo "코드를 고쳐 새 커밋을 올리면 예산이 새로 생깁니다 — 라운드 수에는 상한이 없습니다."
+              echo "코드를 안 고치고 판정만 다시 받으려면 workflow_dispatch 로 PR #${PR_NUMBER} 를 돌리십시오."
+              exit 1
+              ;;
+            ceiling)
+              echo "::error::이 브랜치 누적 리뷰가 안전망 ${PR_CEILING}회에 닿았습니다."
+              echo "여기까지 왔으면 자동 리뷰로 풀 문제가 아닙니다 — 사람이 들여다볼 때입니다."
+              exit 1
+              ;;
+          esac
+
+          # 🔴 비교할 대상이 없으면 통과시키지 않는다.
+          #    HEAD_SHA 가 비면 아래 grep 패턴이 "sha=" 로 줄어들어 **과거의 아무 판정에나
+          #    접두어로 매칭**된다(3일 전 blocking=0 이 오늘 코드의 통과 근거가 된다).
+          #    지금은 dispatch_sha 스텝이 실패하면 GH Actions 가 잡을 실패로 떨어뜨려 주지만,
+          #    그건 우리 안전장치가 아니라 부수 동작이다 — 누가 그 스텝에 continue-on-error 를
+          #    붙이는 순간(합리적 개선으로 보인다) 구멍이 실제로 열린다. 여기서 직접 막는다.
+          if [ -z "${HEAD_SHA}" ]; then
+            echo "::error::HEAD_SHA 가 비어 있습니다 — 판정 대상을 특정할 수 없습니다."
+            echo "앞선 스텝(수동 실행의 SHA 조회)이 실패했을 것입니다. 실행 로그를 확인하십시오."
+            exit 1
+          fi
+
+          # 🔴 판정은 **지금 이 커밋에 대한 것**이어야 한다 (D-90, 2026-08-26 실장애).
+          #    옛 구현은 코멘트 전체에서 마지막 마커를 tail -1 로 집었다. 새 리뷰가 코멘트를
+          #    못 남긴 회차에서 **하루 전 판정을 집어 고친 코드를 떨어뜨렸다.**
+          #    D-86 이 "갱신 안 된 초록은 판정이 아니다" 였다면 이건 그 거울상이다 —
+          #    **빨강도 갱신 안 된 판정일 수 있다.** 그래서 마커에 SHA 를 박고 그것만 인정한다.
+          #    못 찾으면 옛것으로 대신하지 않는다. **판정 없음은 통과도 실패도 아닌 오류다.**
+          # 🔴 그리고 **리뷰어가 쓴 판정**이어야 한다 (2026-08-27 2차 리뷰 Blocking).
+          #    마커는 그냥 코멘트 텍스트이고 HEAD SHA 는 비밀이 아니다. 작성자를 안 보면,
+          #    실제 리뷰가 blocking=3 을 남긴 뒤라도 **누구든 코멘트 한 줄**을
+          #    `<!-- REVIEW-VERDICT blocking=0 sha=<현재SHA> -->` 로 달면 tail -1 이 그것을 집어
+          #    판정이 뒤집힌다. "Blocking 0 이면 승인 없이 머지" 규칙 아래서 이 마커는 사실상
+          #    유일한 게이트다 — 아무나 쓸 수 있으면 게이트가 아니다.
+          #    리뷰를 올리는 주체는 claude-code-action 의 봇 계정 하나뿐이다.
+          # 🔴 `gh api` 에 `--arg` 를 붙이지 말 것 (2026-08-27 실장애).
+          #    `--arg` 는 jq 의 플래그이지 gh 의 것이 아니다. 붙이면 gh 가 `--jq` 의 값으로
+          #    `--arg` 를 먹고 남은 셋(`author` · 봇이름 · jq식)을 위치 인자로 세어
+          #    **`accepts 1 arg(s), received 4`** 로 죽는다. 뒤의 `|| true` 가 그 실패를
+          #    삼켜 VERDICT 가 비고, 리뷰 결과가 무엇이든 **모든 PR 이 무조건 빨개졌다.**
+          #    작성자 검증(2026-08-27 2차 리뷰 Blocking)은 유지하되 봇 이름을 jq 식 안에
+          #    직접 박는다. REVIEW_BOT 은 워크플로가 정하는 리터럴이라 주입 위험이 없다.
+          VERDICT=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq ".[] | select(.user.login == \"${REVIEW_BOT}\") | .body" \
+            | grep -o "REVIEW-VERDICT blocking=[0-9][0-9]* sha=${HEAD_SHA}" \
+            | tail -1 || true)
+
+          if [ -z "${VERDICT}" ]; then
+            echo "::error::이 커밋(${HEAD_SHA:0:7})에 대한 ${REVIEW_BOT} 의 리뷰 판정을 찾지 못했습니다."
+            echo "리뷰가 도중에 끊겼거나(턴 상한·인증 실패) 코멘트를 못 올린 것입니다."
+            echo "🔴 옛 커밋의 판정은 쓰지 않습니다 — 그것은 남의 코드에 대한 판정입니다."
+            echo "판정이 없는 것은 통과가 아닙니다. 실행 로그를 확인하고 다시 돌리십시오."
+            exit 1
+          fi
+
+          COUNT=$(echo "${VERDICT}" | grep -o "blocking=[0-9][0-9]*" | cut -d= -f2)
+          echo "AI 리뷰 판정: Blocking ${COUNT}건"
+
+          # 🔴 2026-08-27 사용자 결정 — Blocking 이 있어도 체크를 빨갛게 만들지 않는다.
+          #    그러므로 이 워크플로는 더 이상 **머지 게이트가 아니다**(#45 가 만든 성질을 뺀다).
+          #    main 보호는 필수 승인 0명 + 필수 체크 `review` 하나이므로, 이 변경 뒤에는
+          #    **Blocking 을 안은 PR 도 아무 제지 없이 머지된다.** 지적은 사람이 읽고 판단한다.
+          #
+          #    이유: 하루 동안 빨강이 네 가지 서로 다른 뜻으로 떴다 — ①진짜 지적 ②판정 쿼리
+          #    자체가 죽음(gh --arg) ③요약 미게시 ④워크플로 수정 PR 의 실행 거부. 구별이 안 되니
+          #    빨강이 신호가 아니라 소음이 됐다. 이제 **빨강은 "리뷰가 제대로 못 돌았다" 하나만
+          #    뜻한다** — 판정 없음·예산 소진은 위에서 그대로 exit 1 로 남겨 뒀다.
+          #
+          #    ⚠️ 되돌리려면 아래 두 줄을 `exit 1` 로 바꾸면 된다(주석의 ::warning:: → ::error::).
+          if [ "${COUNT}" -gt 0 ]; then
+            echo "::warning::Blocking ${COUNT}건 — 머지는 막지 않습니다. Files changed 탭의 인라인 지적을 확인하고 사람이 판단하십시오."
+            echo "🔴 Blocking ${COUNT}건이 남아 있습니다. 체크는 초록이지만 **통과가 아닙니다.**"
+            echo "   지적을 고쳐 다시 푸시하면 리뷰가 자동으로 다시 돕니다."
+            exit 0
+          fi
+
+          echo "Blocking 0건 — 승인 없이 머지할 수 있습니다."

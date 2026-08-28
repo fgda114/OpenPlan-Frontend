@@ -217,33 +217,6 @@ export function composeTimestamp(dayISO, minutes) {
   return d.toISOString()
 }
 
-/*
-  Server `format: time` string ("HH:mm" or "HH:mm:ss" — availabilities'
-  startTime/endTime, FixedScheduleInput's startTime/endTime) <-> this app's
-  own minutes-of-day integer. Moved here from planApi.js (originally private,
-  written for the availability contract) so fixedScheduleApi.js can share the
-  SAME conversion instead of growing its own copy — two independent
-  string<->minutes converters drifting apart is exactly how the fixed-schedule
-  time contract broke in the first place (createFixedSchedule sent
-  startMinutes/endMinutes straight through with no conversion at all).
-*/
-
-/** Server time string → minutes-of-day. `null` when unparseable (not 0 — lets a caller tell "no time sent" apart from "00:00"). */
-export function minutesFromTime(value) {
-  if (typeof value !== 'string') return null
-  const [h, m] = value.split(':').map(Number)
-  if (!Number.isFinite(h) || !Number.isFinite(m)) return null
-  return h * 60 + m
-}
-
-/** Minutes-of-day → the server's own "HH:mm:ss" time string. */
-export function timeFromMinutes(minutes) {
-  const total = Number.isFinite(minutes) ? minutes : 0
-  const h = Math.floor(total / 60)
-  const m = total % 60
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00`
-}
-
 /** "9:05" style short time from minutes-of-day. */
 export function formatMinutesLabel(minutes) {
   const h = Math.floor(minutes / 60)

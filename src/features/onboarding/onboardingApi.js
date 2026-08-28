@@ -2,9 +2,17 @@
   OP functions for ST-F1-13 (온보딩·튜토리얼). `onboarding-progress` is a REAL
   contract (스토리 스펙 §ST-B1-08, BE-1) — only its exact request/response shape
   is unconfirmed in this checkout, so the endpoint path itself is treated as
-  real while the field names stay flexible (see `normalizeProgress`). The
-  import-candidates/decisions pair (ONB-09) has no confirmed contract at all —
-  [가정-확장], same status as settingsApi.js's connections/preferences group.
+  real while the field names stay flexible (see `normalizeProgress`).
+
+  W6 계약 정합(2026-08-28): 이 파일이 예전에 갖고 있던 캘린더 가져오기 한 쌍
+  (`GET /onboarding/import-candidates` / `POST /onboarding/import-decisions`,
+  ONB-09)은 계약에 없는 [가정-신규] 엔드포인트였다 — dev의 mock 폴백에 가려
+  있다가 배포에서만 404로 드러났다. 캘린더 단계(OnboardingCalendarStep)가
+  이제 `features/settings/settingsApi.js`의 실 계약 함수
+  (`getExternalEvents`/`applyExternalEvent`, `/external-calendar-connections`
+  계열)를 `CalendarConnectionSection` 재사용을 통해 그대로 쓰므로 이 파일에서는
+  통째로 제거한다 — 같은 계약 호출이 두 벌 살아 있으면 한쪽만 고쳐질 위험이
+  남는다.
 
   Reuses planApi's withDevFallback rather than redeclaring the one shared
   mock-fallback rule a fifth time (statsApi.js/settingsApi.js already made the
@@ -143,22 +151,4 @@ export function updateOnboardingProgress(patch) {
     // receiving the untranslated patch.
     async () => (await loadOnboardingMock()).patchProgress(patch),
   ).then(normalizeProgress)
-}
-
-/** GET /onboarding/import-candidates ([가정-신규], ONB-09). `provider` selects
- * which connected account's events to list. */
-export function getImportCandidates(provider) {
-  return withDevFallback(
-    () => apiClient.get('/onboarding/import-candidates', { params: { provider } }),
-    async () => (await loadOnboardingMock()).getImportCandidates(provider),
-  )
-}
-
-/** POST /onboarding/import-decisions ([가정-신규]). `decisions` = one entry per
- * candidate event: `{ eventId, mode: 'AS_IS'|'EDITED'|'EXCLUDED' }`. */
-export function submitImportDecisions(provider, decisions) {
-  return withDevFallback(
-    () => apiClient.post('/onboarding/import-decisions', { provider, decisions }),
-    async () => (await loadOnboardingMock()).submitImportDecisions(provider, decisions),
-  )
 }

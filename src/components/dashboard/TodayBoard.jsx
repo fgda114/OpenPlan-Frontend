@@ -5,7 +5,6 @@ import { ErrorState } from '../common/ErrorState'
 import { CheckCircleIcon } from '../common/statusIcons'
 import { useIsDesktop } from '../../hooks/useMediaQuery'
 import { formatDurationKO } from '../../features/plan/planTime'
-import { toast } from '../../hooks/useToasts'
 
 /*
   S3 · 오늘 할 일 (DASH-05 · RB-DASH-02 — ui-spec-dash.md §DASH.3, r2). Row order
@@ -29,9 +28,7 @@ import { toast } from '../../hooks/useToasts'
   - [취소] button added — NOT beside [기록] (round-2 오너 정정: an unlogged
     item only offers [기록]; [취소] appears once an item IS logged, replacing
     the plain "완료" text-only state with "완료" + a way to undo it). Its
-    wiring isn't decided yet, so it's a stub: fires a toast and nothing else.
-    Swap the onClick for the real cancel mutation once that contract exists —
-    the button/layout/disabled-state plumbing is already in place.
+    wiring isn't decided yet — see the honesty fix below (W6, 2026-08-28).
   - "오늘 먼저" badge moved from the FRONT of the row to the END, after the
     title (오너 목업 순서: [시간] [제목] [오늘 먼저]). Also switched from a
     locally-styled span to `<Badge tone="brand" />` — ST-F1-08 landed the
@@ -40,11 +37,20 @@ import { toast } from '../../hooks/useToasts'
     now the real shared component).
 */
 
-/** 취소 스텁 (오너, round 2) — 실제 취소 동작이 아직 정해지지 않아 토스트만
- * 띄운다. 실동작이 정해지면 이 함수를 실제 뮤테이션 호출로 교체하면 된다. */
-function handleCancelStub() {
-  toast({ tone: 'info', message: '취소되었습니다' })
-}
+/*
+  취소 버튼 — 계약 부재로 정직하게 비활성화 (W6, 2026-08-28, 리드 확인).
+  이전엔 아무 일도 안 하면서 "취소되었습니다" 토스트만 띄우는 스텁이었다 —
+  사용자는 취소된 줄 알고 넘어가지만 서버 상태는 그대로였다(침묵보다 나쁜
+  거짓 성공 피드백). 리드가 계약을 확인한 결과 실행 기록을 취소·삭제하는
+  엔드포인트가 없다(`execution-logs`는 POST만 존재) — 즉 지금은 구현할
+  방법 자체가 없다. 그래서 버튼을 감추는 대신 `disabled` +
+  `disabledReason`으로 "왜 못 쓰는지"를 항상 보이는 텍스트로 남긴다
+  (Button.jsx의 disabledReason은 hover 툴팁이 아니라 caption으로 렌더되어
+  키보드/스크린리더 사용자도 이유를 알 수 있다 — SYS-07 §7.2 선례와 동일).
+  서버에 취소 엔드포인트가 생기면 이 disabled를 걷어내고 실제 뮤테이션을
+  onClick에 연결하면 된다 — 버튼/레이아웃은 이미 갖춰져 있다.
+*/
+const CANCEL_DISABLED_REASON = '아직 지원하지 않는 기능입니다'
 
 export function TodayBoard({
   error = false,
@@ -131,12 +137,14 @@ export function TodayBoard({
                   away — this row structurally never gets a [기록] action. */}
               <div className="flex shrink-0 items-center gap-2">
                 {item.completed ? (
+                  // 항상 disabled — 취소를 수행할 서버 엔드포인트가 없다(위
+                  // 헤더 주석 참고). 오프라인일 땐 그 사유를 우선 보여준다
+                  // (더 급한 정보 — 온라인이어도 어차피 못 쓰는 건 매한가지).
                   <Button
                     variant="secondary"
                     size={isDesktop ? 'sm' : 'lg'}
-                    disabled={!canWrite}
-                    disabledReason={!canWrite ? offlineReason : undefined}
-                    onClick={handleCancelStub}
+                    disabled
+                    disabledReason={!canWrite ? offlineReason : CANCEL_DISABLED_REASON}
                   >
                     취소
                   </Button>

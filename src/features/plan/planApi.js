@@ -13,7 +13,6 @@
 import { apiClient } from '../../api/client'
 import { mockBackend } from './planFixtures'
 import { clampPriority } from './planPlacement'
-import { minutesFromTime, timeFromMinutes } from './planTime'
 import { UNSPECIFIED_CONFLICT_CODE, violationCatalog, violationSeverity } from './violationMessages'
 
 // Run the real call; in DEV, fall back to the mock for (a) a genuine network
@@ -145,12 +144,21 @@ function normalizeWeek(w) {
   `weekday` needs no translation: both sides use the same 'MON'…'SUN' keys.
   The DEV mock still answers in the FE's own shape (a bare array of minutes),
   so both directions accept either and only convert what's actually foreign.
-
-  minutesFromTime/timeFromMinutes now live in planTime.js (the app's shared
-  time module) — fixedScheduleApi.js needs the exact same server
-  time-string<->minutes conversion for FixedScheduleInput's own startTime/
-  endTime, and a second private copy here would only invite the two to drift.
 */
+export function minutesFromTime(value) {
+  if (typeof value !== 'string') return null
+  const [h, m] = value.split(':').map(Number)
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null
+  return h * 60 + m
+}
+
+export function timeFromMinutes(minutes) {
+  const total = Number.isFinite(minutes) ? minutes : 0
+  const h = Math.floor(total / 60)
+  const m = total % 60
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00`
+}
+
 function normalizeAvailability(payload) {
   const patterns = Array.isArray(payload) ? payload : (payload?.patterns ?? [])
   return patterns.map((a) => ({

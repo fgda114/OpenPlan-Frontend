@@ -48,13 +48,6 @@ export const TIMEZONE_OPTIONS = [
   { value: 'UTC', label: 'UTC' },
 ]
 
-// ONB-09 "각 일정에 대해 반영 방식 선택" — 원문 3택 그대로.
-export const IMPORT_REFLECT_MODES = [
-  { value: 'AS_IS', label: '그대로 반영' },
-  { value: 'EDITED', label: '수정 후 반영' },
-  { value: 'EXCLUDED', label: '제외' },
-]
-
 export const onboardingCopy = {
   intro: {
     skip: '건너뛰기', // 초대 화면 자체엔 AC상 건너뛰기 언급이 없어 다음 이동만 제공 — 아래 next/start만 사용
@@ -98,12 +91,11 @@ export const onboardingCopy = {
   },
   calendar: {
     heading: '외부 캘린더를 연결해 볼까요',
+    // W6: 반영 흐름(연동 → 캘린더 선택 → 가져와 반영)은 CalendarConnectionSection
+    // 자신이 이미 안내 문구를 갖고 있어(버튼 라벨·선택 캘린더 수 등) 이 단계는
+    // 도입 문구만 갖는다 — 옛 ImportReviewList 전용 문구(importHeading 등)는
+    // 그 컴포넌트와 함께 삭제했다.
     body: 'Google·Apple 캘린더를 연결하면 기존 일정을 OpenPlan으로 가져올 수 있습니다. 지금 하지 않아도 나중에 설정에서 언제든 연결할 수 있습니다.',
-    importHeading: '가져올 일정을 확인하세요',
-    importBody: '각 일정을 그대로 반영할지, 수정 후 반영할지, 제외할지 선택하세요.',
-    noCalendarConnected: '연결된 캘린더가 없습니다 — 위에서 먼저 연동해 주세요',
-    submitImport: '선택한 대로 반영',
-    importSubmitted: '가져오기 설정을 반영했습니다',
   },
   tutorial: {
     kickoffTitle: '핵심 조작을 실습해 볼까요',

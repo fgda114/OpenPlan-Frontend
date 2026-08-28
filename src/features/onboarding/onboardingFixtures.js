@@ -63,16 +63,12 @@ function persist(next) {
 // persisted an older, narrower version.
 let progress = { ...DEFAULT_PROGRESS, ...loadPersisted() }
 
-// ONB-09 "가져올 캘린더의 일정 목록" — provider가 연결·캘린더 선택을 마친 다음
-// 보여줄 후보 이벤트. 실제 외부 캘린더 API 연동이 없으므로 provider와 무관하게
-// 고정된 샘플 목록을 돌려준다([가정-확장] — 실 Swagger 없음, provider 인자는
-// 나중에 실제로 provider별 목록이 갈릴 수 있다는 자리만 잡아 둔다).
-const importCandidates = [
-  { id: 'imp-1', title: '주간 팀 회의', start: '2026-07-28T10:00:00', end: '2026-07-28T11:00:00' },
-  { id: 'imp-2', title: '헬스장 PT', start: '2026-07-28T19:00:00', end: '2026-07-28T20:00:00' },
-  { id: 'imp-3', title: '스터디 모임', start: '2026-07-30T20:00:00', end: '2026-07-30T22:00:00' },
-]
-
+// W6 계약 정합(2026-08-28): ONB-09 "가져올 캘린더의 일정 목록" 샘플 데이터와
+// getImportCandidates/submitImportDecisions 목 메서드를 여기서 제거했다 — 그
+// 둘이 흉내내던 `/onboarding/import-candidates`·`/onboarding/import-decisions`는
+// 계약에 없던 [가정-신규] 엔드포인트였다(onboardingApi.js 헤더 참조). 캘린더
+// 단계는 이제 settingsFixtures.js의 실 계약 mock(connections/events/application)
+// 을 CalendarConnectionSection 재사용을 통해 그대로 쓴다.
 export const onboardingMockBackend = {
   async getProgress() {
     await delay(60)
@@ -84,20 +80,6 @@ export const onboardingMockBackend = {
     progress = { ...progress, ...patch, version: progress.version + 1 }
     persist(progress)
     return { ...progress }
-  },
-
-  async getImportCandidates() {
-    await delay(80)
-    return importCandidates.map((e) => ({ ...e }))
-  },
-
-  // decisions: [{ eventId, mode: 'AS_IS'|'EDITED'|'EXCLUDED' }]. Nothing is
-  // actually persisted server-side in mock mode beyond acknowledging receipt —
-  // the real contract's shape is unconfirmed, so this returns the decisions
-  // back unchanged rather than inventing a stored-events model.
-  async submitImportDecisions(provider, decisions) {
-    await delay()
-    return { provider, decisions, appliedAt: new Date().toISOString() }
   },
 }
 

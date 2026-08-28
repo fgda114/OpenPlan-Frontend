@@ -87,6 +87,19 @@ function availableMinutesOf(availability) {
   their own module: server state in TanStack Query, undo stack in usePlanHistory,
   drag geometry in usePlanDrag/CalendarGrid.
 */
+/*
+  자동 배치 초안에 제목을 잇는다. 서버 응답(openapi PlacementProposal.proposedBlocks)은
+  계약상 blockType·taskId·startAt·endAt 만 싣고 제목이 없는데, 격자의 초안 블록은
+  `title` 로 그린다. 그래서 방금 읽어 둔 미배치 목록에서 taskId 로 찾아 얹는다.
+*/
+function withDraftTitles(draft, unplacedTasks) {
+  const titleById = new Map((unplacedTasks ?? []).map((t) => [t.taskId, t.title]))
+  return {
+    ...draft,
+    placements: (draft?.placements ?? []).map((p) => ({ ...p, title: titleById.get(p.taskId) ?? '' })),
+  }
+}
+
 function WeeklyPage() {
   // Read early: ST-F1-07's `?openReplan=1` seam (below) needs this to seed
   // `replanOpen`'s OWN initial state directly, rather than an Effect that
@@ -555,8 +568,12 @@ function WeeklyPage() {
       setAutoDraft((d) =>
         d
           ? {
+              ...d,
               placements: d.placements.filter((p) => p.taskId !== task.taskId),
-              unplaced: d.unplaced.filter((t) => t.taskId !== task.taskId),
+              // 🔴 unplaced 는 이제 태스크 객체가 아니라 **UUID 문자열 배열**이다
+              //    (계약 unplacedTaskIds). 예전처럼 `t.taskId` 로 비교하면 문자열엔
+              //    그 속성이 없어 언제나 참이 되어 아무것도 안 걸러진다.
+              unplaced: d.unplaced.filter((id) => id !== task.taskId),
             }
           : d,
       )
@@ -625,7 +642,13 @@ function WeeklyPage() {
     toast({ tone: 'info', message: '우선순위·마감일 순으로 배치 중입니다…' })
     autoPlace.mutate(
       { weeklyPlanId: plan.weeklyPlanId },
-      { onSuccess: (result) => setAutoDraft(result) },
+      {
+        // 🔴 초안 블록의 제목은 서버가 주지 않는다 — 계약(PlanBlockInput)이
+        //    blockType·taskId·startAt·endAt 뿐이다. 격자는 `title` 로 그리므로
+        //    (CalendarGrid 의 초안 렌더) 미배치 목록에서 taskId 로 이어 붙인다.
+        //    못 찾으면 제목만 비고 배치 자체는 그대로 유효하다.
+        onSuccess: (result) => setAutoDraft(withDraftTitles(result, unplacedQuery.data)),
+      },
     )
   }
 

@@ -20,10 +20,8 @@ import {
   currentWeekStartISO,
   dateOf,
   formatMinutesLabel,
-  minutesFromTime,
   minutesOfDay,
   snapDuration,
-  timeFromMinutes,
   WEEKDAY_KEYS,
   WEEKDAY_LABELS_KO,
   weekDays,
@@ -234,14 +232,10 @@ function seedUnplacedTasks() {
   They are not returned as plan blocks, so the grid is unchanged.
 */
 function seedFixedSchedules() {
-  // version/startDate/endDate/source/status mirror the ERD fields ST-B2-12
-  // documents (fixed_schedules table) — ST-F1-06 only ever READ weekday/
-  // start/end, so those four were never seeded until ST-F1-12's CRUD needed
-  // them (optimistic lock + MANUAL-only status-edit guard, §ST-B2-12 AC-4).
-  // Field names match FixedScheduleInput (openapi-live-76c7009.yaml:2509)
-  // exactly — startDate/endDate, not the effectiveFrom/effectiveTo this file
-  // used before the fixed-schedule time-contract fix (a guessed name real BE
-  // never sent).
+  // version/effectiveFrom/effectiveTo/source/status mirror the ERD fields
+  // ST-B2-12 documents (fixed_schedules table) — ST-F1-06 only ever READ
+  // weekday/start/end, so those four were never seeded until ST-F1-12's CRUD
+  // needed them (optimistic lock + MANUAL-only status-edit guard, §ST-B2-12 AC-4).
   return [
     {
       fixedScheduleId: nextId('fixed'),
@@ -249,8 +243,8 @@ function seedFixedSchedules() {
       weekday: 'MON',
       startMinutes: 9 * 60,
       endMinutes: 10 * 60,
-      startDate: null,
-      endDate: null,
+      effectiveFrom: null,
+      effectiveTo: null,
       source: 'MANUAL',
       status: 'ACTIVE',
       version: 1,
@@ -261,8 +255,8 @@ function seedFixedSchedules() {
       weekday: 'THU',
       startMinutes: 11 * 60,
       endMinutes: 12 * 60,
-      startDate: null,
-      endDate: null,
+      effectiveFrom: null,
+      effectiveTo: null,
       source: 'MANUAL',
       status: 'ACTIVE',
       version: 1,
@@ -1161,25 +1155,6 @@ function computeDerived(week) {
   }
 }
 
-// Convert a fixed schedule from this store's own internal shape (minutes-of-
-// day, used throughout this file's V2 rule/scanFixedConflicts/replan math)
-// to the WIRE shape the real contract actually speaks (FixedScheduleInput/
-// FixedSchedule: startTime/endTime time strings, not startMinutes/
-// endMinutes). Every mock response that crosses the fixedScheduleApi.js
-// boundary goes through this — if the mock kept answering in minutes, the
-// client's own string<->minutes conversion (fixedScheduleApi.js's
-// normalizeFixedSchedule/serializeFixedSchedule) would never actually run in
-// DEV, and this exact bug (works against the mock, breaks against a real
-// server) would be free to come back unnoticed.
-function toWireFixedSchedule(f) {
-  const { startMinutes, endMinutes, ...rest } = f
-  return {
-    ...rest,
-    startTime: timeFromMinutes(startMinutes),
-    endTime: timeFromMinutes(endMinutes),
-  }
-}
-
 export const mockBackend = {
   // GET /weekly-plans?weekStartDate= — answers with the REAL WeeklyPlanView
   // envelope shape (`{ plan: {...}, blocks: [...] }`, with `unplacedCount`/
@@ -1229,7 +1204,7 @@ export const mockBackend = {
     await delay(60)
     return {
       fixedSchedules: fixedSchedules.map((f) => ({
-        ...toWireFixedSchedule(f),
+        ...f,
         activeThisWeek: isFixedActiveForWeek(f, weekStartISO),
       })),
     }
@@ -1266,35 +1241,30 @@ export const mockBackend = {
     await delay(60)
     return {
       fixedSchedules: fixedSchedules.map((f) => ({
-        ...toWireFixedSchedule(f),
+        ...f,
         hasConflict: scanFixedConflicts(f.weekday, f.startMinutes, f.endMinutes).length > 0,
       })),
     }
   },
 
   // POST /fixed-schedules (ST-B2-12 생성). MANUAL source, ACTIVE status,
-  // version 1 — matches every other create path's fresh-row shape. `body`
-  // now arrives already in wire shape (startTime/endTime strings —
-  // fixedScheduleApi.js's own serializeFixedSchedule converts before calling
-  // either the real POST or this mock), so it's parsed back to minutes here
-  // to match this store's internal representation (used throughout this
-  // file's own V2/replan/conflict-scan math).
+  // version 1 — matches every other create path's fresh-row shape.
   async createFixedSchedule(body) {
     await delay()
     const created = {
       fixedScheduleId: nextId('fixed'),
       title: body.title,
       weekday: body.weekday,
-      startMinutes: minutesFromTime(body.startTime),
-      endMinutes: minutesFromTime(body.endTime),
-      startDate: body.startDate ?? null,
-      endDate: body.endDate ?? null,
+      startMinutes: body.startMinutes,
+      endMinutes: body.endMinutes,
+      effectiveFrom: body.effectiveFrom ?? null,
+      effectiveTo: body.effectiveTo ?? null,
       source: 'MANUAL',
       status: 'ACTIVE',
       version: 1,
     }
     fixedSchedules.push(created)
-    return toWireFixedSchedule(created)
+    return created
   },
 
   // PATCH /fixed-schedules/{id} (ST-B2-12 편집). Same optimistic-lock shape
@@ -1333,20 +1303,16 @@ export const mockBackend = {
       err.details = { latest: { ...existing } }
       throw err
     }
-    // `patch` is already wire-shaped (startTime/endTime — see
-    // fixedScheduleApi.js's serializeFixedSchedule) by the time it reaches
-    // here; parsed back to minutes for this store's internal representation,
-    // same as createFixedSchedule above.
     Object.assign(existing, {
       title: patch.title ?? existing.title,
       weekday: patch.weekday ?? existing.weekday,
-      startMinutes: patch.startTime != null ? minutesFromTime(patch.startTime) : existing.startMinutes,
-      endMinutes: patch.endTime != null ? minutesFromTime(patch.endTime) : existing.endMinutes,
-      startDate: patch.startDate !== undefined ? patch.startDate : existing.startDate,
-      endDate: patch.endDate !== undefined ? patch.endDate : existing.endDate,
+      startMinutes: patch.startMinutes ?? existing.startMinutes,
+      endMinutes: patch.endMinutes ?? existing.endMinutes,
+      effectiveFrom: patch.effectiveFrom !== undefined ? patch.effectiveFrom : existing.effectiveFrom,
+      effectiveTo: patch.effectiveTo !== undefined ? patch.effectiveTo : existing.effectiveTo,
       version: existing.version + 1,
     })
-    return toWireFixedSchedule(existing)
+    return existing
   },
 
   // DELETE /fixed-schedules/{id} (ST-B2-12 AC-3: week_exceptions CASCADE).
@@ -1477,10 +1443,20 @@ export const mockBackend = {
       const { startMin, endMin } = clampBlockSpan(slot.startMin, duration)
       const startAt = composeTimestamp(days[slot.dayIndex], startMin)
       const endAt = composeTimestamp(days[slot.dayIndex], endMin)
-      placements.push({ taskId: task.taskId, title: task.title, startAt, endAt })
+      // 🔴 계약(openapi PlanBlockInput)의 shape 그대로 — blockType 포함, title 없음.
+      //    title 은 서버가 주지 않는다(taskId 로 화면이 잇는다).
+      placements.push({ blockType: 'TASK', taskId: task.taskId, startAt, endAt })
       occupied.push({ startAt, endAt })
     }
-    return { placements, unplaced }
+    // 🔴 이 목이 오래도록 `{ placements, unplaced }` 라는 **계약에 없는 이름**을
+    //    돌려줬고, 어댑터가 거기에 맞춰져 실서버에서만 조용히 깨졌다(2026-08-28).
+    //    목은 클라이언트가 아니라 **계약**을 흉내내야 한다 — 서버와 같은 이름·같은
+    //    모양으로 돌려준다. unplaced 도 태스크 객체가 아니라 UUID 배열이다.
+    return {
+      proposedBlocks: placements,
+      unplacedTaskIds: unplaced.map((t) => t.taskId),
+      reason: '우선순위·마감일·예상시간 순으로 가용 시간에 채웠습니다(first-fit).',
+    }
   },
 
   // POST /weekly-plans/{id}/block-batches — commit an applied auto-place draft.

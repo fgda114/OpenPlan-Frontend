@@ -168,13 +168,30 @@ export function StatusBoard({
           this absolute positioning relative to the CARD, not the viewport).
           variant="outline"(흰 배경 + 파란 글씨, 오너 목업) — 이전엔 primary
           (brand 솔리드 채움)였다. */}
+      {/* 🔴 숨김 클래스를 Button에 직접 주지 말 것 (오너 보고 2026-08-28 —
+          모바일 폭에서 "주간 계획 확인"이 두 개 보였다).
+
+          Button은 자기 기본 클래스에 `inline-flex`를 항상 붙인다. 전달한
+          `hidden`과 `inline-flex`는 특이도가 같아 **CSS에 나중에 나온 쪽이
+          이기는데**, 빌드된 스타일시트에서 `.inline-flex`가 `.hidden`보다
+          뒤에 온다(실측: hidden 13071바이트 / inline-flex 13150바이트).
+          그래서 `hidden md:inline-flex`를 준 데스크톱 버튼이 모바일에서도
+          그려졌다. 반대쪽(`md:hidden`)이 멀쩡했던 것은 반응형 변형이
+          기본 유틸리티보다 뒤에 출력되기 때문일 뿐, 같은 함정이다.
+
+          그래서 표시/숨김은 경쟁 클래스가 없는 래퍼가 맡는다. Button에는
+          레이아웃 클래스(`w-full`)만 남긴다. */}
       <div className="mt-4 md:absolute md:right-5 md:top-5 md:mt-0">
-        <Button variant="outline" size="lg" className="w-full md:hidden" onClick={onOpenWeekly}>
-          주간 계획 확인
-        </Button>
-        <Button variant="outline" size="sm" className="hidden md:inline-flex" onClick={onOpenWeekly}>
-          주간 계획 확인
-        </Button>
+        <div className="md:hidden">
+          <Button variant="outline" size="lg" className="w-full" onClick={onOpenWeekly}>
+            주간 계획 확인
+          </Button>
+        </div>
+        <div className="hidden md:block">
+          <Button variant="outline" size="sm" onClick={onOpenWeekly}>
+            주간 계획 확인
+          </Button>
+        </div>
       </div>
     </div>
   )

@@ -1,17 +1,17 @@
 /*
   TanStack Query wiring for ST-F1-13. Server state (the onboarding-progress
   document) only — the wizard/tutorial's own in-progress edits (profile form
-  fields, which import-decision radio is picked) stay in page-local state
-  until submitted, same server/draft split every other feature follows
-  (design-handoff §3).
+  fields) stay in page-local state until submitted, same server/draft split
+  every other feature follows (design-handoff §3).
+
+  W6 계약 정합(2026-08-28): 캘린더 가져오기 훅(useImportCandidates/
+  useSubmitImportDecisions)을 여기서 제거했다 — 그 둘이 부르던 API가 계약에
+  없는 엔드포인트였다(onboardingApi.js 헤더 참조). 캘린더 단계는 이제
+  `features/settings/useSettings.js`의 실 계약 훅(useApplyCandidateEvents 등)을
+  CalendarConnectionSection 재사용을 통해 그대로 쓴다.
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  getOnboardingProgress,
-  updateOnboardingProgress,
-  getImportCandidates,
-  submitImportDecisions,
-} from './onboardingApi'
+import { getOnboardingProgress, updateOnboardingProgress } from './onboardingApi'
 import { toast } from '../../hooks/useToasts'
 import { systemMessages } from '../../constants/systemMessages'
 
@@ -32,26 +32,6 @@ export function useUpdateOnboardingProgress() {
   return useMutation({
     mutationFn: updateOnboardingProgress,
     onSuccess: (data) => queryClient.setQueryData(onboardingProgressKey(), data),
-    onError: () => toast({ tone: 'error', message: systemMessages.error.writeTitle }),
-  })
-}
-
-export const importCandidatesKey = (provider) => ['onboardingImportCandidates', provider]
-
-/** ONB-09. Only enabled once the caller actually has a provider to list
- * (a connected account with calendars picked) — no point fetching candidates
- * for a still-disconnected provider. */
-export function useImportCandidates(provider) {
-  return useQuery({
-    queryKey: importCandidatesKey(provider),
-    queryFn: () => getImportCandidates(provider),
-    enabled: Boolean(provider),
-  })
-}
-
-export function useSubmitImportDecisions() {
-  return useMutation({
-    mutationFn: ({ provider, decisions }) => submitImportDecisions(provider, decisions),
     onError: () => toast({ tone: 'error', message: systemMessages.error.writeTitle }),
   })
 }
